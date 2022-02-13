@@ -48,6 +48,15 @@ disconnect-vpn() {
 #     #sudo service network-manager reload
 }
 
+restart-vpn() {
+	sudo pkill openconnect 
+	nmcli radio wifi off
+	sleep 2
+	nmcli radio wifi on
+	sleep 5
+	connect-vpn
+}
+
 alias tls="tmux ls"
 alias ta="tmux attach-session -t"
 alias dfs="df -h | grep -v snap"
