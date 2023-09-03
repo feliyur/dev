@@ -123,13 +123,184 @@ monitor-nvidia-smi() {
     watch -n "$1" nvidia-smi
 }
 
-alias dus='du -sh * | sort -k1 -h'
+nvidia-list-gpus() {
+    nvidia-smi --query-gpu=name --format=csv,noheader
+}
+
+
+clone-directory-structure() {
+	from="$1"
+
+	# Resolve real path to prevent weird things such as recursive copy
+	to="`realpath ""$2""`"
+
+	parentdirname=$(basename -- "$from")
+	pushd "$from" > /dev/null
+	find . -type d -exec mkdir -p -- "$to/$parentdirname/{}" \;
+	popd > /dev/null
+}
+
+upgrade-vscode-version() {
+    commit_id=$1
+    pushd ~/.vscode-server/bin/
+    rm -rf "$commit_id"
+    wget  https://update.code.visualstudio.com/commit:${commit_id}/server-linux-x64/stable
+    tar -xf stable 
+    mv vscode-server-linux-x64 "$commit_id" 
+    rm stable
+    popd
+}
+
+git-branch() {
+	git rev-parse --abbrev-ref HEAD ${@}
+}
+
+git-root() {
+	git rev-parse --show-toplevel
+}
+
+git-modified() {
+	git status --porcelain | grep ^M | trim-whitespace | cut -d' ' -f2
+}
+
+trim-whitespace() {
+    awk '{$1=$1};1'
+}
+
+pushas() {
+    git commit -m "$1" && git push
+}
+
+conda-env-dir() {
+	conda info --envs | grep '*' | awk '{print $3}'
+}
+
+conda-workon() {
+	if [ $# -eq 0 ]; then
+		ls -1 $HOME/.conda/envs
+		return
+	fi
+	module load conda;
+	conda activate "$1"
+}
+
+_conda-workon_completions()
+{
+	if [ "${#COMP_WORDS[@]}" != "2" ]; then
+        return 
+	fi
+	
+	envs_options="`ls $HOME/.conda/envs`"
+	COMPREPLY=($(compgen -W "${envs_options}" "${COMP_WORDS[1]}"))
+	# COMPREPLY=($(compgen -W "now tomorrow never" "${COMP_WORDS[1]}"))
+}
+complete -F '_conda-workon_completions' 'conda-workon'
 
 alias git-branch='git rev-parse  --abbrev-ref HEAD'
 
+cluster-launch-interactive-node() {
+	# bs = 60 sets higher priority for interactive job (50 is the default)
+	#bsub -I -q inter_v100 -J 484654846546847 -n 8 -M 16384 -W 9:00 -gpu "num=1" -R "span[hosts=1]" /bin/bash
+	bsub -Is -q inter_v100 -J 2371349357 -n 8 -M 16384 -W 09:00 -gpu "num=1" -R "span[hosts=1]" /bin/bash 
+}
+
+_bkill_completions()
+{
+	# if [ "${#COMP_WORDS[@]}" != "2" ]; then
+        # return 
+	# fi
+	
+    running_job_ids="`bjobs | cut -d' ' -f1 | tail -n+2`"
+	COMPREPLY=($(compgen -W "${running_job_ids}" "${COMP_WORDS[-1]}"))
+}
+complete -F '_bkill_completions' 'bkill'
+
+git-worktree-link()
+{
+    repo="$1"
+    version="$2"
+
+    repo_worktree_dir="$repo.git"
+    if [ ! -e "$repo_worktree_dir" ]; then
+        echo "ERROR: Worktree directory $repo_worktree_dir does not exist at current working directory"
+        return
+    fi
+    echo "worktree dir: $repo_worktree_dir"
+
+    repo_version_dir="$repo_worktree_dir/$version"
+    if [ ! -e "$repo_version_dir" ]; then
+        echo "ERROR: Version directory $repo_version_dir does not exist."
+        return
+    fi
+    echo "version dir: $repo_version_dir"
+
+    # Try to delete repo link (will fail if repo is directory)
+    if [ -e "$repo" ]; then
+        rm $repo
+    fi
+
+    if [ -e "$repo" ]; then
+        echo "ERROR: Unable to delete $repo. Is it a link?"
+        return
+    fi
+
+    echo "Creating link $repo -> $repo_version_dir"
+    ln -s "$repo_version_dir" $repo
+}
+
+git-worktree-link-multiple()
+{
+    version="$1"
+    repos="${@:2}"
+    echo "linking repos $repos to version $version"
+
+    for repo in $repos; do
+        git-worktree-link "$repo" "$version"
+    done
+    
+}
+
+git-repo-to-worktree()
+{
+    repo="$1"
+    cp -r "$repo" "$repo.git"
+    pushd $repo.git
+    git config --bool core.bare true
+    popd
+
+    branch_name=`git -C "${repo}" rev-parse --abbrev-ref HEAD ${@}`
+    echo "Moving $repo to $repo.git/$branch_name"
+    mv "$repo" "${repo}.git/${branch_name}"
+}
+
+cluster-kill-batch() {
+	bkill `bjobs | grep batch | cut -f1 -d' '`
+}
+
+attach-interactive() {
+	interactive_job_id=`bjobs | grep inter_ | cut -f1 -d' '`
+	battach -L `which bash` $interactive_job_id
+}
+
+alias activate-ros='source /opt/ros/noetic/setup.bash'
+
+
+# Show git branch in prompts
 parse_git_branch() {
      git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/(\1)/'
 }
 export PS1="\u@\h \[\e[32m\]\w \[\e[91m\]\$(parse_git_branch)\[\e[00m\]$ "
 
 
+format_and_test() {
+	parent_dir=`dirname "$1"`
+	black "$1" && isort "$1" && black "$parent_dir/tests" && isort "$parent_dir/tests" && pytest "$parent_dir/tests" && pylint "$1" && pylint "$parent_dir/tests"
+}
+
+which-gpu() {
+	nvidia-smi -L | grep "$1"
+}
+
+alias blims="blimits -u $USER"
+
+stty stop ^J
