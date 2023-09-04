@@ -73,6 +73,11 @@ tb() {
 	fi
 }
 
+register-ipykernel() {
+	pip install ipykernel
+	python -m ipykernel install --user --name ${VIRTUAL_ENV##*\/}
+}
+
 kill-pulse() {
 	ps -ae | grep pulse | grep tty | cut -d" " -f1 | xargs kill -9
 }
@@ -200,6 +205,8 @@ conda-setvirtualenvproject()
 {
     echo "cd \"$( readlink -f `pwd` )\"" > $CONDA_PREFIX/etc/conda/activate.d/cwd.sh
 }
+
+alias dus='du -sh * | sort -k1 -rh'
 
 alias git-branch='git rev-parse  --abbrev-ref HEAD'
 
