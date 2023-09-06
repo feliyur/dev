@@ -201,6 +201,11 @@ _conda-workon_completions()
 }
 complete -F '_conda-workon_completions' 'conda-workon'
 
+conda-setvirtualenvproject()
+{
+    echo "cd \"$( readlink -f `pwd` )\"" > $CONDA_PREFIX/etc/conda/activate.d/cwd.sh
+}
+
 alias dus='du -sh * | sort -k1 -rh'
 
 alias git-branch='git rev-parse  --abbrev-ref HEAD'
@@ -208,7 +213,7 @@ alias git-branch='git rev-parse  --abbrev-ref HEAD'
 cluster-launch-interactive-node() {
 	# bs = 60 sets higher priority for interactive job (50 is the default)
 	#bsub -I -q inter_v100 -J 484654846546847 -n 8 -M 16384 -W 9:00 -gpu "num=1" -R "span[hosts=1]" /bin/bash
-	bsub -Is -q inter_v100 -J 2371349357 -n 8 -M 16384 -W 09:00 -gpu "num=1" -R "span[hosts=1]" /bin/bash 
+	bsub -Is -q inter_v100 -J 2371349357 -n 8 -M 32768 -W 09:00 -gpu "num=1" -R "span[hosts=1]" /bin/bash 
 }
 
 _bkill_completions()
