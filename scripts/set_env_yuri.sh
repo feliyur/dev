@@ -185,7 +185,7 @@ conda-workon() {
 		ls -1 $HOME/.conda/envs
 		return
 	fi
-	module load conda;
+    source $HOME/scripts/activate-conda.sh
 	conda activate "$1"
 }
 
