@@ -208,7 +208,6 @@ conda-setvirtualenvproject()
 
 alias dus='du -sh * | sort -k1 -rh'
 
-alias git-branch='git rev-parse  --abbrev-ref HEAD'
 
 cluster-launch-interactive-node() {
 	# bs = 60 sets higher priority for interactive job (50 is the default)
