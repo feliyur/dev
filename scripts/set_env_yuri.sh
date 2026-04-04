@@ -73,6 +73,23 @@ tb() {
 	fi
 }
 
+docker-start-with-proxy() {
+    docker run --network="host" -it --rm -e http_proxy=$http_proxy -e https_proxy=$https_proxy -e ftp_proxy=$ftp_proxy -e no_proxy="$no_proxy" -u $(id -u):$(id -g) ${@:1}
+#--name extract_athena_images bcr-de01.inside.bosch.cloud/perkit/dst-lh5-converter:latest bash
+}
+
+alias tls="tmux ls"
+alias ta="tmux attach-session -t"
+
+tkill() {
+    for var in "$@"
+    do
+        tmux kill-session -t $var
+    done
+}
+
+alias dfs="df -h | grep -v snap"
+
 register-ipykernel() {
 	pip install ipykernel
 	python -m ipykernel install --user --name ${VIRTUAL_ENV##*\/}
@@ -85,6 +102,10 @@ kill-pulse() {
 
 git-status() {
 	watch --color -n 1 git -c color.status=always status "${@}"
+}
+
+git-log() {
+    git log --oneline --pretty=format:"%h %an %s" "${@}"
 }
 
 send-version() {
@@ -147,11 +168,14 @@ clone-directory-structure() {
 
 upgrade-vscode-version() {
     commit_id=$1
-    pushd ~/.vscode-server/bin/
-    rm -rf "$commit_id"
+    pushd ~/.vscode-server/
+    mkdir -p "cli/servers/" && cd cli/servers
+    rm -rf "Stable-$commit_id*"
+    mkdir "Stable-$commit_id" && cd "Stable-$commit_id"
+    internet-on
     wget  https://update.code.visualstudio.com/commit:${commit_id}/server-linux-x64/stable
     tar -xf stable 
-    mv vscode-server-linux-x64 "$commit_id" 
+    mv vscode-server-linux-x64 "server" 
     rm stable
     popd
 }
@@ -168,6 +192,85 @@ git-modified() {
 	git status --porcelain | grep ^M | trim-whitespace | cut -d' ' -f2
 }
 
+git-switch() {
+    # Get current branch name
+    local current_branch=$(git branch --show-current)
+    
+    # Check if there are any changes to stash
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "Stashing changes on branch '$current_branch'..."
+        git stash push -m "Auto-stash from $current_branch"
+        local stashed=true
+    else
+        local stashed=false
+    fi
+    
+    # Perform git switch with all provided parameters
+    echo "Switching branch..."
+    if ! git switch "$@"; then
+        echo "Error: Failed to switch branch"
+        return 1
+    fi
+    
+    # Get the new branch name after switch
+    local new_branch=$(git branch --show-current)
+    
+    # Try to pop the most recent stash that matches the new branch
+    if [[ "$stashed" == "false" ]]; then
+        # Look for existing stash for this branch
+        local stash_entry=$(git stash list | grep "$new_branch" | head -n1 | cut -d: -f1)
+        if [[ -n "$stash_entry" ]]; then
+            echo "Found existing stash for branch '$new_branch', applying..."
+            git stash pop "$stash_entry"
+        fi
+    else
+        # If we just stashed and switched to the same branch, don't pop
+        if [[ "$current_branch" != "$new_branch" ]]; then
+            # Look for existing stash for the new branch
+            local stash_entry=$(git stash list | grep "$new_branch" | head -n1 | cut -d: -f1)
+            if [[ -n "$stash_entry" ]]; then
+                echo "Found existing stash for branch '$new_branch', applying..."
+                git stash pop "$stash_entry"
+            fi
+        fi
+    fi
+}
+
+# Completion function for git-switch
+_git_switch_completion() {
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    # Get git switch options
+    opts="--create -c --force-create -C --detach -d --guess --no-guess --force -f --discard-changes --merge -m --conflict --quiet -q --progress --no-progress --track -t --no-track --orphan --ignore-other-worktrees --recurse-submodules --no-recurse-submodules"
+
+    # If the current word starts with -, complete with options
+    if [[ ${cur} == -* ]]; then
+        COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+        return 0
+    fi
+
+    # For branch names, get local and remote branches
+    case "${prev}" in
+        --create|-c|--force-create|-C|--orphan)
+            # For branch creation, don't complete with existing branches
+            return 0
+            ;;
+        *)
+            # Complete with branch names (local and remote)
+            local branches
+            branches=$(git branch --all --format="%(refname:short)" 2>/dev/null | sed 's|^origin/||' | sort -u)
+            COMPREPLY=( $(compgen -W "${branches}" -- ${cur}) )
+            return 0
+            ;;
+    esac
+}
+
+# Register the completion function
+complete -F _git_switch_completion git-sw
+
 trim-whitespace() {
     awk '{$1=$1};1'
 }
@@ -180,22 +283,24 @@ conda-env-dir() {
 	conda info --envs | grep '*' | awk '{print $3}'
 }
 
+# activate a conda environment. Completion based on ~/.conda/envs directory content
 conda-workon() {
 	if [ $# -eq 0 ]; then
 		ls -1 $HOME/.conda/envs
 		return
 	fi
-    source $HOME/scripts/activate-conda.sh
+	module load conda;
 	conda activate "$1"
 }
 
 _conda-workon_completions()
 {
-	if [ "${#COMP_WORDS[@]}" != "2" ]; then
+	if [ "${#COMP_WORDS[@]}" -gt 2 ]; then
         return 
 	fi
-	
-	envs_options="`ls $HOME/.conda/envs`"
+    environments_txt="`cat $HOME/.conda/environments.txt | while read -r file; do echo "${file##*/}"; done`"
+    environments_dir="`ls $HOME/.conda/envs`"
+    envs_options="$environments_txt $environments_dir"
 	COMPREPLY=($(compgen -W "${envs_options}" "${COMP_WORDS[1]}"))
 	# COMPREPLY=($(compgen -W "now tomorrow never" "${COMP_WORDS[1]}"))
 }
@@ -344,5 +449,10 @@ _claude_suggest() {
 bind -x '"\C-g": _claude_suggest'
 
 alias blims="blimits -u $USER"
+
+function cd_up() {
+  cd $(printf "%0.s../" $(seq 1 $1 ));
+}
+alias 'cd..'='cd_up'
 
 stty stop ^J
