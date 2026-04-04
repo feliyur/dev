@@ -312,6 +312,37 @@ which-gpu() {
 	nvidia-smi -L | grep "$1"
 }
 
+# Claude CLI completion via Ctrl+G
+_claude_suggest() {
+  local prompt="${READLINE_LINE}"
+  if [[ -z "$prompt" ]]; then return; fi
+
+  # Print below the current line without disrupting readline
+  tput sc       # save cursor
+  tput cud1     # move down one line
+  tput el       # clear to end of line
+  echo -n "(claude thinking...)"
+
+  local result
+  result=$(claude -p --model haiku \
+    "Give me a single shell command (no explanation, no markdown, no backticks) that does: $prompt" \
+    2>/dev/null)
+
+  tput rc       # restore cursor position (clears the "thinking..." line)
+  tput el       # clear to end of line
+
+  if [[ -z "$result" ]]; then
+    tput cud1; echo -n "claude error: no response"; tput rc
+    return 1
+  fi
+
+  # Replace the current line with the result
+  READLINE_LINE="$result"
+  READLINE_POINT=${#result}
+}
+
+bind -x '"\C-g": _claude_suggest'
+
 alias blims="blimits -u $USER"
 
 stty stop ^J
