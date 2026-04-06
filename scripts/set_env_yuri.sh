@@ -286,10 +286,11 @@ conda-env-dir() {
 # activate a conda environment. Completion based on ~/.conda/envs directory content
 conda-workon() {
 	if [ $# -eq 0 ]; then
-		ls -1 $HOME/.conda/envs
+		if [ -d "$HOME/.conda/envs" ]; then
+			ls -1 "$HOME/.conda/envs"
+		fi
 		return
 	fi
-	module load conda;
 	conda activate "$1"
 }
 
@@ -298,8 +299,17 @@ _conda-workon_completions()
 	if [ "${#COMP_WORDS[@]}" -gt 2 ]; then
         return 
 	fi
-    environments_txt="`cat $HOME/.conda/environments.txt | while read -r file; do echo "${file##*/}"; done`"
-    environments_dir="`ls $HOME/.conda/envs`"
+
+    environments_txt=""
+    if [ -f "$HOME/.conda/environments.txt" ]; then
+        environments_txt="$(while read -r file; do echo "${file##*/}"; done < "$HOME/.conda/environments.txt")"
+    fi
+
+    environments_dir=""
+    if [ -d "$HOME/.conda/envs" ]; then
+        environments_dir="$(ls "$HOME/.conda/envs")"
+    fi
+
     envs_options="$environments_txt $environments_dir"
 	COMPREPLY=($(compgen -W "${envs_options}" "${COMP_WORDS[1]}"))
 	# COMPREPLY=($(compgen -W "now tomorrow never" "${COMP_WORDS[1]}"))
