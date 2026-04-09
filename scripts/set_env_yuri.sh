@@ -318,6 +318,11 @@ complete -F '_conda-workon_completions' 'conda-workon'
 
 conda-setvirtualenvproject()
 {
+    if [ -z "$CONDA_PREFIX" ]; then
+        echo "Error: not inside a conda environment." >&2
+        return 1
+    fi
+    mkdir -p "$CONDA_PREFIX/etc/conda/activate.d/"
     echo "cd \"$( readlink -f `pwd` )\"" > $CONDA_PREFIX/etc/conda/activate.d/cwd.sh
 }
 
