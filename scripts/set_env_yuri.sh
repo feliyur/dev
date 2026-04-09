@@ -439,7 +439,7 @@ _claude_suggest() {
   echo -n "(claude thinking...)"
 
   local result
-  result=$(claude -p --model haiku \
+  result=$(claude -p --bare --model haiku \
     "Give me a single shell command (no explanation, no markdown, no backticks) that does: $prompt" \
     2>/dev/null)
 
