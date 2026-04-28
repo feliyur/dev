@@ -142,7 +142,7 @@ send-version() {
 
 
 monitor-disk() {
-	watch -n 3 'df -h | grep -v snap'	
+	watch -n 3 "df -h | grep -v 'snap\|tmpfs'"
 }
 
 monitor-nvidia-smi() {
@@ -444,7 +444,7 @@ _claude_suggest() {
   echo -n "(claude thinking...)"
 
   local result
-  result=$(claude -p --bare --model haiku \
+  result=$(ANTHROPIC_API_KEY=$_ANTHROPIC_API_KEY MAX_THINKING_TOKENS=0 claude -p --bare --model haiku \
     "Give me a single shell command (no explanation, no markdown, no backticks) that does: $prompt" \
     2>/dev/null)
 
