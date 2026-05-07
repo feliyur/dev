@@ -81,6 +81,13 @@ docker-start-with-proxy() {
 alias tls="tmux ls"
 alias ta="tmux attach-session -t"
 
+_ta_completions() {
+    local sessions
+    sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null)
+    COMPREPLY=($(compgen -W "${sessions}" -- "${COMP_WORDS[COMP_CWORD]}"))
+}
+complete -F _ta_completions ta
+
 tkill() {
     for var in "$@"
     do
