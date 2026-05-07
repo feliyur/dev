@@ -477,4 +477,124 @@ function cd_up() {
 }
 alias 'cd..'='cd_up'
 
+vscode-to-cmd() {
+    # Usage: launch-to-cmd <config-name> [path/to/launch.json]
+    local config_name="$1"
+    local json_path="${2:-.vscode/launch.json}"
+    python3 - "$json_path" "$config_name" <<'PYEOF'
+import sys, re, json, shlex
+
+json_path, config_name = sys.argv[1], sys.argv[2]
+try:
+    with open(json_path) as f:
+        text = f.read()
+except FileNotFoundError:
+    print(f"Error: '{json_path}' not found", file=sys.stderr)
+    sys.exit(1)
+
+def strip_jsonc(s):
+    out, i, in_str = [], 0, False
+    while i < len(s):
+        ch = s[i]
+        if ch == '\\' and in_str:
+            out += [ch, s[i + 1] if i + 1 < len(s) else '']
+            i += 2
+            continue
+        if ch == '"':
+            in_str = not in_str
+        elif not in_str and s[i:i + 2] == '//':
+            while i < len(s) and s[i] != '\n':
+                i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+text = re.sub(r',(\s*[}\]])', r'\1', strip_jsonc(text))
+data = json.loads(text)
+
+cfg = next((c for c in data['configurations'] if c['name'] == config_name), None)
+if cfg is None:
+    available = [c['name'] for c in data['configurations']]
+    print(f"Error: config '{config_name}' not found", file=sys.stderr)
+    print(f"Available: {available}", file=sys.stderr)
+    sys.exit(1)
+
+parts = [f'{k}={shlex.quote(v)}' for k, v in cfg.get('env', {}).items()]
+parts.append(shlex.quote(cfg.get('python', 'python')))
+parts.append(shlex.quote(cfg.get('program', '')))
+for arg in cfg.get('args', []):
+    parts.append(shlex.quote(arg) if arg else "''")
+print(' '.join(parts))
+PYEOF
+}
+
+cmd-to-vscode() {
+    # Usage: cmd-to-launch [command...]  or  echo "cmd" | cmd-to-launch
+    local -a _args
+    if [ $# -eq 0 ]; then
+        _args=(0 "$(cat)")
+    else
+        _args=("$#" "$@")
+    fi
+    python3 - "${_args[@]}" <<'PYEOF'
+import sys, re, json, shlex
+
+mode = int(sys.argv[1])
+tokens = shlex.split(sys.argv[2]) if mode == 0 else list(sys.argv[2:])
+
+env = {}
+while tokens and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', tokens[0]):
+    k, v = tokens.pop(0).split('=', 1)
+    env[k] = v
+
+python_field = None
+if tokens and re.match(r'.*python[\d.]*$', tokens[0]):
+    interp = tokens.pop(0)
+    if interp not in ('python', 'python3'):
+        python_field = interp
+
+program = tokens.pop(0) if tokens else ''
+
+args_entries = []
+i = 0
+while i < len(tokens):
+    tok = tokens[i]
+    if tok.startswith('-') and i + 1 < len(tokens) and not tokens[i + 1].startswith('-'):
+        args_entries.append((tok, tokens[i + 1]))
+        i += 2
+    else:
+        args_entries.append((tok,))
+        i += 1
+
+ind = '    '
+lines = ['{']
+lines.append(f'{ind}"name": "My Config",')
+lines.append(f'{ind}"type": "debugpy",')
+lines.append(f'{ind}"request": "launch",')
+if python_field:
+    lines.append(f'{ind}"python": {json.dumps(python_field)},')
+lines.append(f'{ind}"program": {json.dumps(program)},')
+if args_entries:
+    lines.append(f'{ind}"args": [')
+    for j, entry in enumerate(args_entries):
+        comma = ',' if j < len(args_entries) - 1 else ''
+        if len(entry) == 2:
+            lines.append(f'{ind}{ind}{json.dumps(entry[0])}, {json.dumps(entry[1])}{comma}')
+        else:
+            lines.append(f'{ind}{ind}{json.dumps(entry[0])}{comma}')
+    lines.append(f'{ind}],')
+lines.append(f'{ind}"console": "integratedTerminal"{"," if env else ""}')
+if env:
+    lines.append(f'{ind}"env": {{')
+    items = list(env.items())
+    for j, (k, v) in enumerate(items):
+        comma = ',' if j < len(items) - 1 else ''
+        lines.append(f'{ind}{ind}{json.dumps(k)}: {json.dumps(v)}{comma}')
+    lines.append(f'{ind}}}')
+lines.append('}')
+print('\n'.join(lines))
+PYEOF
+}
+
 stty stop ^J
