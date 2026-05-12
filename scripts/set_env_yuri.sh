@@ -115,37 +115,227 @@ git-log() {
     git log --oneline --pretty=format:"%h %an %s" "${@}"
 }
 
-send-version() {
-	target_host="$1"
-	version="$2"
+git-clonewtb() {
+  local repo_url="${1:?Usage: clonewtb <repo-url> [branch] [--target-dir <dir>]}"
+  local branch=""
+  local target_dir=""
 
-	version_prefix="/home/yuri/Research/data/lightning_logs/lsmi_trainer/"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --target-dir)
+        target_dir="${2:?--target-dir requires an argument}"
+        shift 2
+        ;;
+      -*)
+        echo "clonewtb: unknown option '$1'" >&2
+        return 1
+        ;;
+      *)
+        if [[ -z "$branch" ]]; then
+          branch="$1"
+        else
+          echo "clonewtb: unexpected argument '$1'" >&2
+          return 1
+        fi
+        shift
+        ;;
+    esac
+  done
 
-	tempdir=`mktemp -d`
+  target_dir="${target_dir:-$(basename "$repo_url" .git)}"
 
-	local_version_dir="${version_prefix}/$version"
+  git clone --bare "$repo_url" "$target_dir/.bare" || return 1
+  echo "gitdir: ./.bare" > "$target_dir/.git"
 
-	if [[ ! -d "$local_version_dir" ]]; then
-		echo "Version does not exist at ${local_version_dir}"
-		return 1
-	fi
+  # Fall back to the repo's default branch if none specified
+  if [[ -z "$branch" ]]; then
+    branch=$(git -C "$target_dir/.bare" symbolic-ref --short HEAD 2>/dev/null) \
+      || { echo "clonewtb: could not detect default branch" >&2; return 1; }
+  fi
 
-	tar_name="${version##*/}.tar.gz"
-	tar_loc="${version%/*}"
+  git -C "$target_dir/.bare" worktree add "../$branch" "$branch" || return 1
 
-	pushd "$tempdir"
-	tar --exclude "plots" --exclude "training" --exclude "validation" --exclude "*tfevents*" -cvzf "${tar_name}" -C "${local_version_dir}/.." "${version##*/}"
-
-	popd
-
-	ssh ${target_host} -C "mkdir -p \"${version_prefix}/${tar_loc}\""
-	rsync -av --progress "${tempdir}/$tar_name" "${target_host}:${version_prefix}/${tar_loc}"
-
-	rm -rf "${tempdir}"
-
-	ssh ${target_host} -C "pushd \"${version_prefix}/${tar_loc}\"; tar -xvf \"$tar_name\"; rm \"$tar_name\""
+  echo "✓ $target_dir/"
+  echo "    .bare/       (bare repo)"
+  echo "    $branch/     (worktree — $branch)"
 }
 
+check-ssh-access() {
+  local target_path="${1:?Usage: check_ssh_access <path> <user> [r|w|x]}"
+  local username="${2:?Usage: check_ssh_access <path> <user> [r|w|x]}"
+  local mode="${3:-r}"
+  local uid gid groups
+  local found_issues=0
+
+  uid=$(id -u "$username" 2>/dev/null) \
+    || { echo "check_ssh_access: user '$username' not found" >&2; return 1; }
+  gid=$(id -g "$username")
+  groups=$(id -G "$username")
+
+  [[ "$mode" =~ ^[rwx]$ ]] \
+    || { echo "check_ssh_access: mode must be r, w, or x" >&2; return 1; }
+
+  # Convert mode letter to bit: r=4 w=2 x=1
+  local mode_bit
+  case "$mode" in
+    r) mode_bit=4 ;;
+    w) mode_bit=2 ;;
+    x) mode_bit=1 ;;
+  esac
+
+  _csa_check_component() {
+    local check_path="$1"
+    local needed_bit="$2"
+    local label="$3"
+    local issues=()
+
+    local owner owner_gid perms mode_str
+    owner=$(stat -c '%U' "$check_path" 2>/dev/null)
+    owner_gid=$(stat -c '%g' "$check_path")
+    perms=$(stat -c '%a' "$check_path")
+    mode_str=$(stat -c '%A' "$check_path")
+
+    local applicable_bits perm_source
+    if [[ "$username" == "$owner" ]]; then
+      applicable_bits=$(( (8#$perms >> 6) & 7 ))
+      perm_source="owner"
+    elif echo "$groups" | grep -qw "$owner_gid"; then
+      applicable_bits=$(( (8#$perms >> 3) & 7 ))
+      perm_source="group"
+    else
+      applicable_bits=$(( 8#$perms & 7 ))
+      perm_source="other"
+    fi
+
+    if (( (applicable_bits & needed_bit) == 0 )); then
+      issues+=("permission denied ($perm_source bits: $mode_str)")
+    fi
+
+    if command -v getfacl &>/dev/null; then
+      local acl_out
+      acl_out=$(getfacl -p "$check_path" 2>/dev/null)
+
+      local acl_user_entry
+      acl_user_entry=$(echo "$acl_out" | grep -E "^user:${username}:")
+      if [[ -n "$acl_user_entry" ]]; then
+        local acl_perms
+        acl_perms=$(echo "$acl_user_entry" | cut -d: -f3)
+        case "$mode" in
+          r) [[ "$acl_perms" != *r* ]] && issues+=("ACL user entry denies 'r': $acl_user_entry") ;;
+          w) [[ "$acl_perms" != *w* ]] && issues+=("ACL user entry denies 'w': $acl_user_entry") ;;
+          x) [[ "$acl_perms" != *x* ]] && issues+=("ACL user entry denies 'x': $acl_user_entry") ;;
+        esac
+      fi
+
+      local mask_entry
+      mask_entry=$(echo "$acl_out" | grep -E "^mask::")
+      if [[ -n "$mask_entry" ]]; then
+        local mask_perms
+        mask_perms=$(echo "$mask_entry" | cut -d: -f3)
+        case "$mode" in
+          r) [[ "$mask_perms" != *r* ]] && issues+=("ACL mask restricts 'r': $mask_entry") ;;
+          w) [[ "$mask_perms" != *w* ]] && issues+=("ACL mask restricts 'w': $mask_entry") ;;
+          x) [[ "$mask_perms" != *x* ]] && issues+=("ACL mask restricts 'x': $mask_entry") ;;
+        esac
+      fi
+    fi
+
+    if [[ ${#issues[@]} -gt 0 ]]; then
+      printf "  ✗ %s\n" "$label"
+      for issue in "${issues[@]}"; do
+        printf "      → %s\n" "$issue"
+      done
+      found_issues=1
+    else
+      printf "  ✓ %s\n" "$label"
+    fi
+  }
+
+  # Walk every component of a path, checking traverse (x) on directories
+  # and the requested mode on the final target.
+  # Recursively called when a symlink is encountered.
+  _csa_walk_path() {
+    local walk_path="$1"
+    local final_mode_bit="$2"
+    local final_mode_label="$3"
+    local depth="${4:-0}"
+
+    local indent
+    indent=$(printf '%*s' $(( depth * 2 )) '')
+
+    local parts current
+    IFS='/' read -ra parts <<< "$walk_path"
+    [[ "$walk_path" == /* ]] && current="/" || current="."
+
+    local components=()
+    for part in "${parts[@]}"; do
+      [[ -n "$part" ]] && components+=("$part")
+    done
+
+    local i
+    for (( i=0; i<${#components[@]}; i++ )); do
+      local part="${components[$i]}"
+      [[ "$current" == "/" ]] && current="/$part" || current="$current/$part"
+
+      if [[ ! -e "$current" && ! -L "$current" ]]; then
+        printf "  ✗ %s%s  → does not exist\n" "$indent" "$current"
+        found_issues=1
+        return
+      fi
+
+      local is_last=$(( i == ${#components[@]} - 1 ))
+
+      # Detect symlink before deciding what to check
+      if [[ -L "$current" ]]; then
+        local link_target
+        link_target=$(readlink -f "$current")
+        if (( is_last )); then
+          printf "  ↳ %s%s  (symlink → %s)\n" "$indent" "$current" "$link_target"
+        else
+          printf "  ↳ %s%s  (symlink → %s, following...)\n" "$indent" "$current" "$link_target"
+        fi
+
+        # Walk the symlink target path from its root
+        _csa_walk_path "$link_target" "$final_mode_bit" "$final_mode_label" $(( depth + 1 ))
+
+        # If it was a mid-path symlink the rest of the original path is already
+        # absorbed into the resolved target by readlink -f, so we're done.
+        return
+      fi
+
+      if (( is_last )); then
+        _csa_check_component "$current" "$final_mode_bit" \
+          "${indent}${current}  (target — ${final_mode_label})"
+      else
+        _csa_check_component "$current" 1 \
+          "${indent}${current}  (directory — traverse)"
+      fi
+    done
+  }
+
+  echo "Checking '$mode' access to '$target_path' for user '$username' (uid=$uid)"
+  echo ""
+
+  local mode_label
+  case "$mode" in
+    r) mode_label="read" ;;
+    w) mode_label="write" ;;
+    x) mode_label="execute" ;;
+  esac
+
+  _csa_walk_path "$target_path" "$mode_bit" "$mode_label" 0
+
+  echo ""
+  if [[ $found_issues -eq 0 ]]; then
+    echo "✓ No issues found — '$username' can $mode_label '$target_path'"
+  else
+    echo "✗ Access problems found for '$username' on '$target_path'"
+  fi
+
+  # Clean up inner functions
+  unset -f _csa_check_component _csa_walk_path
+}
 
 
 monitor-disk() {
