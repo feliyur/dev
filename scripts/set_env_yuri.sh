@@ -787,4 +787,54 @@ print('\n'.join(lines))
 PYEOF
 }
 
+# Add projects here. Keys are what you type after `workon`.
+declare -A WORKON_PROJECTS=(
+[scripts]="$HOME/dev/scripts",
+[ai-defect-detection]="/media/ai-ubuntu/DATA/projects/Yuri/ai-defect-detection"
+)
+
+# Snapshot any pre-existing `workon` (e.g. from virtualenvwrapper) as `_workon_venv`.
+# Idempotent: only runs the first time, so re-sourcing .bashrc won't wrap our own function.
+# NOTE: if you later add `source virtualenvwrapper.sh` to this file, put it ABOVE this block
+# so the snapshot picks up its `workon` definition.
+if declare -F workon >/dev/null 2>&1 && ! declare -F _workon_venv >/dev/null 2>&1; then
+	eval "$(declare -f workon | sed '1 s/^workon /_workon_venv /')"
+fi
+
+workon() {
+	local name="$1"
+	if [[ -n "$name" && -n "${WORKON_PROJECTS[$name]:-}" ]]; then
+	  cd -- "${WORKON_PROJECTS[$name]}" || return
+	  return 0
+	fi
+	if declare -F _workon_venv >/dev/null 2>&1; then
+	  _workon_venv "$@"
+	  return $?
+	fi
+	if [[ -z "$name" ]]; then
+	  printf 'Projects:\n'
+	  printf '  %s -> %s\n' "${!WORKON_PROJECTS[@]}" "${WORKON_PROJECTS[@]}" \
+	      | paste -d' ' - - | sort
+	  return 0
+	fi
+	printf 'workon: unknown project %q (and no virtualenvwrapper fallback found)\n' "$name" >&2
+	return 1
+}
+
+# Tab completion: project names + virtualenvwrapper venvs (subdirs of $WORKON_HOME, if set).
+_workon_complete() {
+	[[ $COMP_CWORD -eq 1 ]] || return 0
+	local cur="${COMP_WORDS[COMP_CWORD]}"
+	local -a opts=( "${!WORKON_PROJECTS[@]}" )
+	if [[ -n "${WORKON_HOME:-}" && -d "$WORKON_HOME" ]]; then
+	  local d
+	  for d in "$WORKON_HOME"/*/; do
+	      [[ -d "$d" ]] || continue
+	      opts+=( "$(basename "$d")" )
+	  done
+	fi
+	COMPREPLY=( $(compgen -W "${opts[*]}" -- "$cur") )
+}
+complete -F _workon_complete workon
+
 stty stop ^J
