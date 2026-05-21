@@ -789,8 +789,9 @@ PYEOF
 
 # Add projects here. Keys are what you type after `workon`.
 declare -A WORKON_PROJECTS=(
-[scripts]="$HOME/dev/scripts",
+[scripts]="$HOME/dev/scripts"
 [ai-defect-detection]="/media/ai-ubuntu/DATA/projects/Yuri/ai-defect-detection"
+[repos]="$HOME/Repos"
 )
 
 # Snapshot any pre-existing `workon` (e.g. from virtualenvwrapper) as `_workon_venv`.
@@ -801,40 +802,143 @@ if declare -F workon >/dev/null 2>&1 && ! declare -F _workon_venv >/dev/null 2>&
 	eval "$(declare -f workon | sed '1 s/^workon /_workon_venv /')"
 fi
 
-workon() {
-	local name="$1"
-	if [[ -n "$name" && -n "${WORKON_PROJECTS[$name]:-}" ]]; then
-	  cd -- "${WORKON_PROJECTS[$name]}" || return
-	  return 0
-	fi
-	if declare -F _workon_venv >/dev/null 2>&1; then
-	  _workon_venv "$@"
-	  return $?
-	fi
-	if [[ -z "$name" ]]; then
-	  printf 'Projects:\n'
-	  printf '  %s -> %s\n' "${!WORKON_PROJECTS[@]}" "${WORKON_PROJECTS[@]}" \
-	      | paste -d' ' - - | sort
-	  return 0
-	fi
-	printf 'workon: unknown project %q (and no virtualenvwrapper fallback found)\n' "$name" >&2
-	return 1
+# Merge entries from the user-editable env file ($WORKON_ENVS_LIST) into the
+# caller's associative array (passed by name). Lines look like `name=/path`;
+# `#` comments and blank lines are skipped. On a name collision with the
+# caller's array, the file value wins; a one-shot warning per name per shell
+# is emitted to stderr.
+_workon_load_envs() {
+    local -n _out="$1"
+    local file="${WORKON_ENVS_LIST:-$HOME/.workon_envs}"
+    [[ -z "$file" || ! -f "$file" ]] && return 0
+    local line name path guard
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+        [[ "$line" != *=* ]] && continue
+        name="${line%%=*}"
+        path="${line#*=}"
+        [[ -z "$name" ]] && continue
+        if [[ -n "${_out[$name]:-}" && "${_out[$name]}" != "$path" ]]; then
+            guard="_WORKON_WARNED_${name//[^A-Za-z0-9_]/_}"
+            if [[ -z "${!guard:-}" ]]; then
+                printf 'workon: %s from %s overrides built-in (%s)\n' \
+                    "$name" "$file" "${_out[$name]}" >&2
+                printf -v "$guard" '%s' 1
+            fi
+        fi
+        _out[$name]="$path"
+    done < "$file"
 }
 
-# Tab completion: project names + virtualenvwrapper venvs (subdirs of $WORKON_HOME, if set).
+workon() {
+    local name="$1"
+    local -A _envs
+    local k
+    for k in "${!WORKON_PROJECTS[@]}"; do _envs[$k]="${WORKON_PROJECTS[$k]}"; done
+    _workon_load_envs _envs
+
+    if [[ -n "$name" && -n "${_envs[$name]:-}" ]]; then
+        cd -- "${_envs[$name]}" || return
+        return 0
+    fi
+    if declare -F _workon_venv >/dev/null 2>&1; then
+        _workon_venv "$@"
+        return $?
+    fi
+    if [[ -z "$name" ]]; then
+        printf 'Projects:\n'
+        for k in "${!_envs[@]}"; do
+            printf '  %s -> %s\n' "$k" "${_envs[$k]}"
+        done | sort
+        return 0
+    fi
+    printf 'workon: unknown project %q (and no virtualenvwrapper fallback found)\n' "$name" >&2
+    return 1
+}
+
+# Tab completion: project names (array + file) + virtualenvwrapper venvs.
 _workon_complete() {
-	[[ $COMP_CWORD -eq 1 ]] || return 0
-	local cur="${COMP_WORDS[COMP_CWORD]}"
-	local -a opts=( "${!WORKON_PROJECTS[@]}" )
-	if [[ -n "${WORKON_HOME:-}" && -d "$WORKON_HOME" ]]; then
-	  local d
-	  for d in "$WORKON_HOME"/*/; do
-	      [[ -d "$d" ]] || continue
-	      opts+=( "$(basename "$d")" )
-	  done
-	fi
-	COMPREPLY=( $(compgen -W "${opts[*]}" -- "$cur") )
+    [[ $COMP_CWORD -eq 1 ]] || return 0
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local -A _envs
+    local k
+    for k in "${!WORKON_PROJECTS[@]}"; do _envs[$k]="${WORKON_PROJECTS[$k]}"; done
+    _workon_load_envs _envs 2>/dev/null
+    local -a opts=( "${!_envs[@]}" )
+    if [[ -n "${WORKON_HOME:-}" && -d "$WORKON_HOME" ]]; then
+        local d
+        for d in "$WORKON_HOME"/*/; do
+            [[ -d "$d" ]] || continue
+            opts+=( "$(basename "$d")" )
+        done
+    fi
+    COMPREPLY=( $(compgen -W "${opts[*]}" -- "$cur") )
 }
 complete -F _workon_complete workon
+
+# Register the current directory as a workon env. With no arg, the name is the
+# basename of $PWD; pass an explicit name to override. Initializes
+# $WORKON_ENVS_LIST to ~/.workon_envs if unset.
+workon-add() {
+    local name="${1:-$(basename "$PWD")}"
+    local path="$PWD"
+    if [[ ! "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        printf 'workon-add: invalid name %q (use [A-Za-z0-9_.-])\n' "$name" >&2
+        return 1
+    fi
+    if [[ -z "${WORKON_ENVS_LIST:-}" ]]; then
+        export WORKON_ENVS_LIST="$HOME/.workon_envs"
+    fi
+    touch -- "$WORKON_ENVS_LIST" || return 1
+
+    if [[ -n "${WORKON_PROJECTS[$name]:-}" ]]; then
+        printf 'workon-add: %s already in WORKON_PROJECTS (%s); file entry will override.\n' \
+            "$name" "${WORKON_PROJECTS[$name]}" >&2
+    fi
+    if grep -q "^${name}=" -- "$WORKON_ENVS_LIST" 2>/dev/null; then
+        printf 'workon-add: replacing existing entry for %s\n' "$name" >&2
+        sed -i.bak "/^${name}=/d" -- "$WORKON_ENVS_LIST" && rm -f -- "$WORKON_ENVS_LIST.bak"
+    fi
+    printf '%s=%s\n' "$name" "$path" >> "$WORKON_ENVS_LIST"
+    unset "_WORKON_WARNED_${name//[^A-Za-z0-9_]/_}"
+    printf 'workon-add: %s -> %s (in %s)\n' "$name" "$path" "$WORKON_ENVS_LIST"
+}
+
+# Remove a workon env by name from $WORKON_ENVS_LIST. Entries hardcoded in
+# WORKON_PROJECTS can only be removed by editing this script.
+workon-rm() {
+    local name="${1:?usage: workon-rm <name>}"
+    if [[ ! "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        printf 'workon-rm: invalid name %q\n' "$name" >&2
+        return 1
+    fi
+    local file="${WORKON_ENVS_LIST:-$HOME/.workon_envs}"
+    if [[ ! -f "$file" ]]; then
+        printf 'workon-rm: %s does not exist\n' "$file" >&2
+        return 1
+    fi
+    if ! grep -q "^${name}=" -- "$file"; then
+        if [[ -n "${WORKON_PROJECTS[$name]:-}" ]]; then
+            printf 'workon-rm: %s is hardcoded in WORKON_PROJECTS; edit set_env_yuri.sh to remove it.\n' "$name" >&2
+        else
+            printf 'workon-rm: no entry named %s in %s\n' "$name" "$file" >&2
+        fi
+        return 1
+    fi
+    sed -i.bak "/^${name}=/d" -- "$file" && rm -f -- "$file.bak"
+    unset "_WORKON_WARNED_${name//[^A-Za-z0-9_]/_}"
+    printf 'workon-rm: removed %s from %s\n' "$name" "$file"
+}
+
+_workon_rm_complete() {
+    [[ $COMP_CWORD -eq 1 ]] || return 0
+    local file="${WORKON_ENVS_LIST:-$HOME/.workon_envs}"
+    [[ -f "$file" ]] || return 0
+    local names
+    names=$(sed -n 's/^\([A-Za-z0-9_.-]\+\)=.*/\1/p' -- "$file")
+    COMPREPLY=( $(compgen -W "$names" -- "${COMP_WORDS[COMP_CWORD]}") )
+}
+complete -F _workon_rm_complete workon-rm
 
 stty stop ^J
