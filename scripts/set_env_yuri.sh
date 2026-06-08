@@ -731,20 +731,50 @@ cmd-to-vscode() {
 import sys, re, json, shlex
 
 mode = int(sys.argv[1])
-tokens = shlex.split(sys.argv[2]) if mode == 0 else list(sys.argv[2:])
+if mode == 0:
+    # Drop shell line-continuations (`\` + newline) so pasted multi-line
+    # commands don't leak stray backslash/newline tokens.
+    raw = re.sub(r'\\\s*\n', ' ', sys.argv[2])
+    tokens = shlex.split(raw)
+else:
+    tokens = list(sys.argv[2:])
 
 env = {}
 while tokens and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', tokens[0]):
     k, v = tokens.pop(0).split('=', 1)
     env[k] = v
 
+# Strip a leading runner prefix like `uv run`, `poetry run`, `pdm run`, ...
 python_field = None
+RUNNERS = {'uv', 'poetry', 'pdm', 'pipenv', 'rye', 'hatch'}
+if tokens and tokens[0] in RUNNERS:
+    runner = tokens.pop(0)
+    if tokens and tokens[0] == 'run':
+        tokens.pop(0)
+    # uv conventionally uses a project-local .venv; point debugpy at it.
+    if runner == 'uv':
+        python_field = '${workspaceFolder}/.venv/bin/python'
+
+# Detect the python interpreter token (python, python3, python3.11, /path/python).
 if tokens and re.match(r'.*python[\d.]*$', tokens[0]):
     interp = tokens.pop(0)
-    if interp not in ('python', 'python3'):
+    if interp not in ('python', 'python3') and python_field is None:
         python_field = interp
 
-program = tokens.pop(0) if tokens else ''
+# Collect interpreter flags (e.g. -u, -O, -X dev) into pythonArgs, stopping at
+# the program path or a `-m module`.
+python_args = []
+module = None
+while tokens and tokens[0].startswith('-'):
+    flag = tokens.pop(0)
+    if flag == '-m':
+        module = tokens.pop(0) if tokens else ''
+        break
+    python_args.append(flag)
+    if flag in ('-X', '-W') and tokens and not tokens[0].startswith('-'):
+        python_args.append(tokens.pop(0))
+
+program = '' if module is not None else (tokens.pop(0) if tokens else '')
 
 args_entries = []
 i = 0
@@ -764,7 +794,12 @@ lines.append(f'{ind}"type": "debugpy",')
 lines.append(f'{ind}"request": "launch",')
 if python_field:
     lines.append(f'{ind}"python": {json.dumps(python_field)},')
-lines.append(f'{ind}"program": {json.dumps(program)},')
+if module is not None:
+    lines.append(f'{ind}"module": {json.dumps(module)},')
+else:
+    lines.append(f'{ind}"program": {json.dumps(program)},')
+if python_args:
+    lines.append(f'{ind}"pythonArgs": {json.dumps(python_args)},')
 if args_entries:
     lines.append(f'{ind}"args": [')
     for j, entry in enumerate(args_entries):
