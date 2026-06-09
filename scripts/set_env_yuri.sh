@@ -1,6 +1,9 @@
 #! /bin/bash
 
 
+# SSH into $1, forwarding local ports <map_id>022/006/888/097 to the remote's
+# 22/6006/8888/8097 (sshd, TensorBoard, Jupyter, Visdom). Extra args ${@:3:4}
+# are passed through to ssh.
 connect-develop() {
 	target=$1
 	map_id=$2
@@ -8,6 +11,8 @@ connect-develop() {
 	ssh $target -L ${map_id}022:localhost:22 -L ${map_id}006:localhost:6006 -L ${map_id}888:localhost:8888 -L ${map_id}097:localhost:8097 ${@:3:4}
 }
 
+# Start the Technion openconnect VPN. With no args, connect locally via sudo;
+# with a host arg, connect the VPN on that remote host over SSH.
 connect-vpn() {
     #command='openconnect -b --protocol=nc --user=yurif@campus.technion.ac.il https://132.68.237.250'
     command='openconnect -b --protocol=nc --user=yurif@campus.technion.ac.il SSLVPN-CLUSTER.technion.ac.il'
@@ -21,6 +26,8 @@ connect-vpn() {
     
 }
 
+# Kill openconnect and reload networking to tear down the VPN. With no args,
+# act locally; with a host arg, do it on that remote host over SSH.
 disconnect-vpn() {
     command='sudo -S kill -9 `pidof openconnect` > /dev/null 2>&1; sleep 2; sudo -S service network-manager reload > /dev/null 2>&1; sudo -S service networking reload > /dev/null 2>&1'
     if [ "$#" -ge 1 ]; then
@@ -48,8 +55,9 @@ disconnect-vpn() {
 #     #sudo service network-manager reload
 }
 
+# Kill the VPN, bounce the Wi-Fi radio off/on, then reconnect via connect-vpn.
 restart-vpn() {
-	sudo pkill openconnect 
+	sudo pkill openconnect
 	nmcli radio wifi off
 	sleep 2
 	nmcli radio wifi on
@@ -61,8 +69,10 @@ alias tls="tmux ls"
 alias ta="tmux attach-session -t"
 alias dfs="df -h | grep -v snap"
 
+# Launch TensorBoard (under a per-user $TMPDIR). With no args serves the default
+# logdir; with a first arg uses it as --logdir, passing ${@:2} through.
 tb() {
-	#echo num arguments $# 
+	#echo num arguments $#
 	if (( $# < 1 )); then
 		# logdir="`ls | tail -1`" 
 		export TMPDIR=/tmp/$USER; mkdir -p $TMPDIR; tensorboard serve
@@ -73,6 +83,9 @@ tb() {
 	fi
 }
 
+# Run a docker container on the host network with the shell's proxy env vars
+# (http/https/ftp/no_proxy) forwarded and the current uid:gid. Args are passed
+# to `docker run` (e.g. image and command).
 docker-start-with-proxy() {
     docker run --network="host" -it --rm -e http_proxy=$http_proxy -e https_proxy=$https_proxy -e ftp_proxy=$ftp_proxy -e no_proxy="$no_proxy" -u $(id -u):$(id -g) ${@:1}
 #--name extract_athena_images bcr-de01.inside.bosch.cloud/perkit/dst-lh5-converter:latest bash
@@ -81,6 +94,7 @@ docker-start-with-proxy() {
 alias tls="tmux ls"
 alias ta="tmux attach-session -t"
 
+# Bash completion for `ta`: complete with current tmux session names.
 _ta_completions() {
     local sessions
     sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null)
@@ -88,6 +102,7 @@ _ta_completions() {
 }
 complete -F _ta_completions ta
 
+# Kill each named tmux session given as an argument.
 tkill() {
     for var in "$@"
     do
@@ -97,24 +112,33 @@ tkill() {
 
 alias dfs="df -h | grep -v snap"
 
+# Install ipykernel and register the active virtualenv as a Jupyter kernel
+# named after the venv directory.
 register-ipykernel() {
 	pip install ipykernel
 	python -m ipykernel install --user --name ${VIRTUAL_ENV##*\/}
 }
 
+# Force-kill PulseAudio processes attached to a tty (clears stuck audio).
 kill-pulse() {
 	ps -ae | grep pulse | grep tty | cut -d" " -f1 | xargs kill -9
 }
 
 
+# Live-refresh `git status` once a second with color preserved; extra args pass
+# through to git status.
 git-status() {
 	watch --color -n 1 git -c color.status=always status "${@}"
 }
 
+# One-line git log formatted as "<hash> <author> <subject>"; args pass through.
 git-log() {
     git log --oneline --pretty=format:"%h %an %s" "${@}"
 }
 
+# Clone a repo into a worktree-friendly layout: a bare repo under
+# <target>/.bare plus a checked-out worktree for the given (or default) branch.
+# Usage: git-clonewtb <repo-url> [branch] [--target-dir <dir>].
 git-clonewtb() {
   local repo_url="${1:?Usage: clonewtb <repo-url> [branch] [--target-dir <dir>]}"
   local branch=""
@@ -161,6 +185,10 @@ git-clonewtb() {
   echo "    $branch/     (worktree — $branch)"
 }
 
+# Diagnose whether a user can r/w/x a path: walks every path component checking
+# traverse (x) on dirs and the requested mode on the target, accounting for
+# owner/group/other bits, POSIX ACLs/masks, and following symlinks.
+# Usage: check-ssh-access <path> <user> [r|w|x].
 check-ssh-access() {
   local target_path="${1:?Usage: check_ssh_access <path> <user> [r|w|x]}"
   local username="${2:?Usage: check_ssh_access <path> <user> [r|w|x]}"
@@ -184,6 +212,8 @@ check-ssh-access() {
     x) mode_bit=1 ;;
   esac
 
+  # Inner helper: check one path component for a needed permission bit,
+  # reporting denials from unix mode bits, ACL user entries, and ACL masks.
   _csa_check_component() {
     local check_path="$1"
     local needed_bit="$2"
@@ -255,6 +285,8 @@ check-ssh-access() {
   # Walk every component of a path, checking traverse (x) on directories
   # and the requested mode on the final target.
   # Recursively called when a symlink is encountered.
+  # Inner helper: recurse through path components, requiring traverse (x) on
+  # each directory and the requested mode on the final target.
   _csa_walk_path() {
     local walk_path="$1"
     local final_mode_bit="$2"
@@ -338,19 +370,24 @@ check-ssh-access() {
 }
 
 
+# Continuously watch disk usage (`df -h`) excluding snap/tmpfs mounts.
 monitor-disk() {
 	watch -n 3 "df -h | grep -v 'snap\|tmpfs'"
 }
 
+# Continuously watch `nvidia-smi`, refreshing every $1 seconds.
 monitor-nvidia-smi() {
     watch -n "$1" nvidia-smi
 }
 
+# Print the model name of each NVIDIA GPU, one per line.
 nvidia-list-gpus() {
     nvidia-smi --query-gpu=name --format=csv,noheader
 }
 
 
+# Replicate the directory tree of $1 (without files) under $2, nested in a
+# folder named after $1's basename.
 clone-directory-structure() {
 	from="$1"
 
@@ -363,6 +400,9 @@ clone-directory-structure() {
 	popd > /dev/null
 }
 
+# Download and install the VS Code remote server binary for a given commit id
+# into ~/.vscode-server, replacing any existing build for that commit (fixes a
+# client/server version mismatch).
 upgrade-vscode-version() {
     commit_id=$1
     pushd ~/.vscode-server/
@@ -377,18 +417,24 @@ upgrade-vscode-version() {
     popd
 }
 
+# Print the current git branch name; extra args pass through to rev-parse.
 git-branch() {
 	git rev-parse --abbrev-ref HEAD ${@}
 }
 
+# Print the absolute path of the current git repository's top-level directory.
 git-root() {
 	git rev-parse --show-toplevel
 }
 
+# List paths of modified (status M) tracked files in the current repo.
 git-modified() {
 	git status --porcelain | grep ^M | trim-whitespace | cut -d' ' -f2
 }
 
+# Branch-aware `git switch`: auto-stashes uncommitted changes before switching
+# and pops any stash previously saved for the destination branch. All args pass
+# through to `git switch`.
 git-switch() {
     # Get current branch name
     local current_branch=$(git branch --show-current)
@@ -433,7 +479,8 @@ git-switch() {
     fi
 }
 
-# Completion function for git-switch
+# Bash completion for git-switch: complete `git switch` flags after `-`, else
+# local/remote branch names (origin/ prefix stripped, deduped).
 _git_switch_completion() {
     local cur prev opts
     COMPREPLY=()
@@ -468,14 +515,17 @@ _git_switch_completion() {
 # Register the completion function
 complete -F _git_switch_completion git-sw
 
+# Filter: collapse leading/trailing whitespace on each line of stdin.
 trim-whitespace() {
     awk '{$1=$1};1'
 }
 
+# Commit all staged changes with message $1 and push in one step.
 pushas() {
     git commit -m "$1" && git push
 }
 
+# Print the filesystem path of the currently active conda environment.
 conda-env-dir() {
 	conda info --envs | grep '*' | awk '{print $3}'
 }
@@ -491,6 +541,8 @@ conda-workon() {
 	conda activate "$1"
 }
 
+# Bash completion for conda-workon: complete env names from
+# ~/.conda/environments.txt and ~/.conda/envs.
 _conda-workon_completions()
 {
 	if [ "${#COMP_WORDS[@]}" -gt 2 ]; then
@@ -513,6 +565,8 @@ _conda-workon_completions()
 }
 complete -F '_conda-workon_completions' 'conda-workon'
 
+# Pin the current directory to the active conda env: writes an activate.d hook
+# so activating the env always `cd`s back into this project directory.
 conda-setvirtualenvproject()
 {
     if [ -z "$CONDA_PREFIX" ]; then
@@ -526,12 +580,15 @@ conda-setvirtualenvproject()
 alias dus='du -sh * | sort -k1 -rh'
 
 
+# Request an interactive LSF GPU node (1 V100, 8 cores, 32 GB, 9h) and drop
+# into a shell on it.
 cluster-launch-interactive-node() {
 	# bs = 60 sets higher priority for interactive job (50 is the default)
 	#bsub -I -q inter_v100 -J 484654846546847 -n 8 -M 16384 -W 9:00 -gpu "num=1" -R "span[hosts=1]" /bin/bash
 	bsub -Is -q inter_v100 -J 2371349357 -n 8 -M 32768 -W 09:00 -gpu "num=1" -R "span[hosts=1]" /bin/bash 
 }
 
+# Bash completion for `bkill`: complete with the user's running LSF job ids.
 _bkill_completions()
 {
 	# if [ "${#COMP_WORDS[@]}" != "2" ]; then
@@ -543,6 +600,8 @@ _bkill_completions()
 }
 complete -F '_bkill_completions' 'bkill'
 
+# Symlink <repo> to a specific worktree version under <repo>.git/<version>.
+# Usage: git-worktree-link <repo> <version>.
 git-worktree-link()
 {
     repo="$1"
@@ -576,6 +635,8 @@ git-worktree-link()
     ln -s "$repo_version_dir" $repo
 }
 
+# Point several repos at the same worktree version via git-worktree-link.
+# Usage: git-worktree-link-multiple <version> <repo>...
 git-worktree-link-multiple()
 {
     version="$1"
@@ -588,6 +649,8 @@ git-worktree-link-multiple()
     
 }
 
+# Convert a normal clone into worktree layout: copy <repo> to <repo>.git, mark
+# it bare, and move the original checkout to <repo>.git/<current-branch>.
 git-repo-to-worktree()
 {
     repo="$1"
@@ -601,10 +664,12 @@ git-repo-to-worktree()
     mv "$repo" "${repo}.git/${branch_name}"
 }
 
+# Kill all of the user's LSF batch (non-interactive) jobs.
 cluster-kill-batch() {
 	bkill `bjobs | grep batch | cut -f1 -d' '`
 }
 
+# Attach a bash session to the user's running interactive LSF job.
 attach-interactive() {
 	interactive_job_id=`bjobs | grep inter_ | cut -f1 -d' '`
 	battach -L `which bash` $interactive_job_id
@@ -613,23 +678,29 @@ attach-interactive() {
 alias activate-ros='source /opt/ros/noetic/setup.bash'
 
 
-# Show git branch in prompts
+# Print the current git branch wrapped in parens for use in PS1 (empty outside
+# a repo). Used by the PS1 export just below.
 parse_git_branch() {
      git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/(\1)/'
 }
 export PS1="\u@\h \[\e[32m\]\w \[\e[91m\]\$(parse_git_branch)\[\e[00m\]$ "
 
 
+# Format and lint a Python module $1 and its sibling tests/ dir: run black and
+# isort on both, then pytest and pylint. Stops at the first failure.
 format_and_test() {
 	parent_dir=`dirname "$1"`
 	black "$1" && isort "$1" && black "$parent_dir/tests" && isort "$parent_dir/tests" && pytest "$parent_dir/tests" && pylint "$1" && pylint "$parent_dir/tests"
 }
 
+# List NVIDIA GPUs whose `nvidia-smi -L` line matches the pattern $1.
 which-gpu() {
 	nvidia-smi -L | grep "$1"
 }
 
-# Claude CLI completion via Ctrl+G
+# Readline widget (bound to Ctrl+G below): treat the current command line as a
+# natural-language request, ask the Claude CLI (haiku) for a single shell
+# command, and replace the line with the result.
 _claude_suggest() {
   local prompt="${READLINE_LINE}"
   if [[ -z "$prompt" ]]; then return; fi
@@ -662,13 +733,16 @@ bind -x '"\C-g": _claude_suggest'
 
 alias blims="blimits -u $USER"
 
+# cd up $1 directory levels (e.g. `cd_up 3` == ../../..). Aliased as `cd..`.
 function cd_up() {
   cd $(printf "%0.s../" $(seq 1 $1 ));
 }
 alias 'cd..'='cd_up'
 
+# Convert a VS Code launch.json debug config into an equivalent shell command
+# line (env vars + interpreter + program + args), printed to stdout.
 vscode-to-cmd() {
-    # Usage: launch-to-cmd <config-name> [path/to/launch.json]
+    # Usage: vscode-to-cmd <config-name> [path/to/launch.json]
     local config_name="$1"
     local json_path="${2:-.vscode/launch.json}"
     python3 - "$json_path" "$config_name" <<'PYEOF'
@@ -719,8 +793,11 @@ print(' '.join(parts))
 PYEOF
 }
 
+# Inverse of vscode-to-cmd: parse a Python command line (from args or stdin) —
+# env vars, runner prefixes like `uv run`, interpreter, flags, -m module, and
+# program args — into a printed VS Code debugpy launch.json config.
 cmd-to-vscode() {
-    # Usage: cmd-to-launch [command...]  or  echo "cmd" | cmd-to-launch
+    # Usage: cmd-to-vscode [command...]  or  echo "cmd" | cmd-to-vscode
     local -a _args
     if [ $# -eq 0 ]; then
         _args=(0 "$(cat)")
@@ -866,6 +943,9 @@ _workon_load_envs() {
     done < "$file"
 }
 
+# cd to a registered project by name, merging built-in WORKON_PROJECTS with the
+# user file ($WORKON_ENVS_LIST). Falls back to any snapshotted virtualenvwrapper
+# `workon` (_workon_venv); with no arg, lists known projects.
 workon() {
     local name="$1"
     local -A _envs
@@ -966,6 +1046,7 @@ workon-rm() {
     printf 'workon-rm: removed %s from %s\n' "$name" "$file"
 }
 
+# Bash completion for workon-rm: complete with env names from $WORKON_ENVS_LIST.
 _workon_rm_complete() {
     [[ $COMP_CWORD -eq 1 ]] || return 0
     local file="${WORKON_ENVS_LIST:-$HOME/.workon_envs}"
