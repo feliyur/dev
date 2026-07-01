@@ -520,6 +520,35 @@ trim-whitespace() {
     awk '{$1=$1};1'
 }
 
+# Swap path separators between Windows (\) and Unix (/) style. Takes the path
+# from the argument, or from stdin if no argument is given. If the input has
+# backslashes it is treated as Windows-style and converted to Unix (\ -> /);
+# otherwise it is converted to Windows (/ -> \). A mixed input is treated as
+# Windows-style (any backslash wins), so it always becomes Unix. Runs of
+# repeated separators are collapsed to a single one (e.g. //foo\\bar -> /foo/bar).
+# Usage: swap-fileseps 'C:\foo\bar'   or   echo /foo/bar | swap-fileseps
+swap-fileseps() {
+    local input out sep
+    if [ "$#" -ge 1 ]; then
+        input="$1"
+    else
+        input="$(cat)"
+    fi
+    if [[ "$input" == *\\* ]]; then
+        out="${input//\\//}"    # windows -> unix
+        sep='/'
+    else
+        out="${input////\\}"    # unix -> windows
+        sep='\'
+    fi
+    # Collapse runs of the output separator into a single one.
+    while [[ "$out" == *"$sep$sep"* ]]; do
+        out="${out//"$sep$sep"/"$sep"}"
+    done
+    printf '%s\n' "$out"
+}
+alias swapsep='swap-fileseps'
+
 # Commit all staged changes with message $1 and push in one step.
 pushas() {
     git commit -m "$1" && git push
@@ -1056,5 +1085,92 @@ _workon_rm_complete() {
     COMPREPLY=( $(compgen -W "$names" -- "${COMP_WORDS[COMP_CWORD]}") )
 }
 complete -F _workon_rm_complete workon-rm
+
+# Mount Samba/CIFS shares, fashioned after ~/mount/mount.sh. Idempotent.
+# Usage:
+#   mount-samba <ip>                       mount every advertised share under /mnt/<_-separated-ip>/
+#   mount-samba //<ip>/<share>             mount that one share at /mnt/<_-separated-ip>/<share>
+#   mount-samba //<ip>/<share> <mnt/path>  mount that one share nested under /mnt: /mnt/<mnt/path>
+# e.g.  mount-samba 10.5.2.100
+#       mount-samba //10.5.2.100/AI_Research            -> /mnt/10_5_2_100/AI_Research
+#       mount-samba //10.5.2.100/AI_Research mount/path -> /mnt/mount/path
+mount-samba() {
+    local username="ai-ubuntu"
+    local password="mnbmnb"
+    local base_mount_point="/mnt"
+
+    local spec="$1"
+    local explicit_path="$2"
+    if [[ -z "$spec" ]]; then
+        echo "Usage: mount-samba <ip|//ip/share> [mount/path]" >&2
+        echo "  mount-samba 10.5.2.100                          # all shares -> /mnt/10_5_2_100/..." >&2
+        echo "  mount-samba //10.5.2.100/AI_Research            # -> /mnt/10_5_2_100/AI_Research" >&2
+        echo "  mount-samba //10.5.2.100/AI_Research mount/path # -> /mnt/mount/path" >&2
+        return 1
+    fi
+
+    # CIFS mount options shared by every mount below.
+    local mount_opts="username=$username,password=$password,uid=$(id -u),gid=$(id -g),file_mode=0664,dir_mode=0775"
+
+    # Inner helper: mount one //server/share at the given mount point (idempotent).
+    _ms_mount_one() {
+        local server_ip="$1" share="$2" mount_point="$3"
+        if mountpoint -q "$mount_point"; then
+            echo "Skipping already mounted share: $mount_point"
+            return 0
+        fi
+        sudo mkdir -p "$mount_point"
+        echo "Mounting //$server_ip/$share to $mount_point"
+        sudo mount -t cifs "//$server_ip/$share" "$mount_point" -o "$mount_opts"
+    }
+
+    # Parse the spec into server_ip and an optional share.
+    local server_ip share
+    if [[ "$spec" == //* ]]; then
+        local rest="${spec#//}"      # ip/share or just ip
+        server_ip="${rest%%/*}"
+        if [[ "$rest" == "$server_ip" ]]; then
+            share=""                 # "//ip" with no share -> scan
+        else
+            share="${rest#*/}"
+        fi
+    else
+        server_ip="$spec"
+        share=""
+    fi
+
+    # _-separated IP, e.g. 10.5.2.100 -> 10_5_2_100
+    local ip_path="${server_ip//./_}"
+
+    if [[ -n "$share" ]]; then
+        # Single explicit share.
+        local mount_point
+        if [[ -n "$explicit_path" ]]; then
+            mount_point="$base_mount_point/${explicit_path#/}"
+        else
+            mount_point="$base_mount_point/$ip_path/$share"
+        fi
+        _ms_mount_one "$server_ip" "$share" "$mount_point"
+        unset -f _ms_mount_one
+        return
+    fi
+
+    # No share given: an explicit mount path makes no sense here.
+    if [[ -n "$explicit_path" ]]; then
+        echo "mount-samba: a mount path is only valid together with a //ip/share spec" >&2
+        unset -f _ms_mount_one
+        return 1
+    fi
+
+    # Scan the server and mount every advertised disk share (skipping printers).
+    echo "Scanning shares on $server_ip..."
+    while read -r share; do
+        [ -z "$share" ] && continue
+        [[ "$share" == print* ]] && continue
+        _ms_mount_one "$server_ip" "$share" "$base_mount_point/$ip_path/$share"
+    done < <(smbclient -L "//$server_ip" -U "$username%$password" 2>/dev/null | grep "Disk" | awk '{print $1}')
+
+    unset -f _ms_mount_one
+}
 
 stty stop ^J
