@@ -2,13 +2,14 @@
 """Show a table of available GPUs and what is occupying them.
 
 For each NVIDIA GPU it prints memory/utilization and the processes running on
-it, resolving each process to its owning user and full command line.
+it, resolving each process to its owning user and full command line. Works on
+the local machine (default) or a remote host over SSH (--host).
 
-No external dependencies -- uses nvidia-smi plus /proc.
+No external dependencies -- uses nvidia-smi and ps.
 """
 import argparse
 import os
-import pwd
+import shlex
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,17 @@ import time
 
 # --- tiny color helper (auto-disabled when not a TTY or NO_COLOR set) ---------
 _USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+# Target host for data collection; None means run locally. Set from --host.
+_HOST = None
+
+
+def sh(argv):
+    """Wrap a command list to run locally or on the remote host via SSH."""
+    if _HOST:
+        return ["ssh", "-o", "BatchMode=yes", _HOST,
+                " ".join(shlex.quote(a) for a in argv)]
+    return argv
 
 
 def c(text, code):
@@ -35,7 +47,7 @@ def run_smi(query, extra=None):
     cmd = ["nvidia-smi", f"--query-{query}", "--format=csv,noheader,nounits"]
     if extra:
         cmd += extra
-    out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+    out = subprocess.check_output(sh(cmd), text=True, stderr=subprocess.PIPE)
     rows = []
     for line in out.splitlines():
         line = line.strip()
@@ -44,26 +56,26 @@ def run_smi(query, extra=None):
     return rows
 
 
-def proc_info(pid):
-    """Return (user, command) for a pid using /proc; ('?', '?') if gone."""
+def lookup_procs(pids):
+    """Map each pid -> (user, command) via a single ps call (local or remote).
+
+    One ps invocation covers every pid, so a remote host is hit once rather
+    than once per process. Pids that have exited are simply absent from the map.
+    """
+    pids = [str(p).strip() for p in pids if str(p).strip()]
+    if not pids:
+        return {}
+    cmd = ["ps", "-ww", "-o", "pid=,user=,args=", "-p", ",".join(pids)]
     try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return "?", "?"
-    user = "?"
-    try:
-        uid = os.stat(f"/proc/{pid}").st_uid
-        user = pwd.getpwuid(uid).pw_name
-    except (FileNotFoundError, PermissionError, KeyError):
-        pass
-    cmd = "?"
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            raw = f.read()
-        cmd = raw.replace(b"\x00", b" ").decode(errors="replace").strip() or "?"
-    except (FileNotFoundError, PermissionError):
-        pass
-    return user, cmd
+        out = subprocess.check_output(sh(cmd), text=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        return {}  # ps exits non-zero when none of the pids are alive
+    table = {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) >= 2:
+            table[parts[0]] = (parts[1], parts[2] if len(parts) > 2 else "?")
+    return table
 
 
 def color_util(pct):
@@ -104,7 +116,9 @@ def render():
             "utilization.gpu,temperature.gpu,power.draw"
         )
     except subprocess.CalledProcessError as e:
-        return f"nvidia-smi failed: {e}"
+        detail = (e.stderr or "").strip() or str(e)
+        target = f"host {_HOST}" if _HOST else "local GPUs"
+        return f"failed to query {target}: {detail}"
 
     # Map each GPU uuid -> its process list.
     procs_by_uuid = {}
@@ -116,9 +130,13 @@ def render():
     except subprocess.CalledProcessError:
         pass
 
+    ptable = lookup_procs(
+        pid for plist in procs_by_uuid.values() for (pid, _m, _n) in plist
+    )
     term_w = shutil.get_terminal_size((100, 24)).columns
 
-    emit(bold("GPU status") + dim(f"   ({len(gpu_rows)} device(s))"))
+    where = f" on {_HOST}" if _HOST else ""
+    emit(bold("GPU status") + dim(f"{where}   ({len(gpu_rows)} device(s))"))
     emit("=" * min(term_w, 100))
 
     for row in gpu_rows:
@@ -136,7 +154,7 @@ def render():
         else:
             emit("        " + dim(f"{'PID':>7}  {'USER':<12} {'MEM':>9}  COMMAND"))
             for pid, mem, pname in procs:
-                user, cmd = proc_info(pid)
+                user, cmd = ptable.get(pid, ("?", pname))
                 if cmd == "?":
                     cmd = pname  # fall back to nvidia-smi's process name
                 # keep the whole line within the terminal width
@@ -165,7 +183,9 @@ def render_brief():
             "gpu=index,uuid,memory.total,memory.used,utilization.gpu"
         )
     except subprocess.CalledProcessError as e:
-        return f"nvidia-smi failed: {e}"
+        detail = (e.stderr or "").strip() or str(e)
+        target = f"host {_HOST}" if _HOST else "local GPUs"
+        return f"failed to query {target}: {detail}"
 
     procs_by_uuid = {}
     try:
@@ -175,6 +195,10 @@ def render_brief():
             procs_by_uuid.setdefault(uuid, []).append((pid, mem, pname))
     except subprocess.CalledProcessError:
         pass
+
+    ptable = lookup_procs(
+        pid for plist in procs_by_uuid.values() for (pid, _m, _n) in plist
+    )
 
     def clean(s):
         return s.replace("\t", " ").replace("\n", " ")
@@ -186,7 +210,7 @@ def render_brief():
         procs = procs_by_uuid.get(uuid, [])
         if procs:
             for pid, mem, pname in procs:
-                user, cmd = proc_info(pid)
+                user, cmd = ptable.get(pid, ("?", pname))
                 if cmd == "?":
                     cmd = pname
                 lines.append("\t".join(gpu_cols + [pid, user, mem, clean(cmd)]))
@@ -208,9 +232,16 @@ def main():
         help="one tab-separated line per process (gpu, util, mem_used, "
              "mem_total, pid, user, proc_mib, command) for easy parsing",
     )
+    ap.add_argument(
+        "-H", "--host", metavar="[USER@]HOST",
+        help="query a remote host over SSH instead of the local machine",
+    )
     args = ap.parse_args()
 
-    if not shutil.which("nvidia-smi"):
+    global _HOST
+    _HOST = args.host
+
+    if _HOST is None and not shutil.which("nvidia-smi"):
         sys.exit("nvidia-smi not found -- no NVIDIA driver on this machine.")
 
     frame_fn = render_brief if args.brief else render
