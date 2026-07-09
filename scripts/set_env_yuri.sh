@@ -1091,37 +1091,102 @@ complete -F _workon_rm_complete workon-rm
 #   mount-samba <ip>                       mount every advertised share under /mnt/<_-separated-ip>/
 #   mount-samba //<ip>/<share>             mount that one share at /mnt/<_-separated-ip>/<share>
 #   mount-samba //<ip>/<share> <mnt/path>  mount that one share nested under /mnt: /mnt/<mnt/path>
+#   mount-samba -H [user@]host <ip> ...    create the mount on a remote host over SSH
 # e.g.  mount-samba 10.5.2.100
 #       mount-samba //10.5.2.100/AI_Research            -> /mnt/10_5_2_100/AI_Research
 #       mount-samba //10.5.2.100/AI_Research mount/path -> /mnt/mount/path
+#       mount-samba -H ai-ubuntu@10.5.2.50 //10.5.2.100/AI_Research   (mounts on 10.5.2.50)
+# The remote user needs sudo for mount: either NOPASSWD sudo, or pass -S to be
+# prompted once for the remote sudo password (fed to sudo -S over SSH stdin).
 mount-samba() {
     local username="ai-ubuntu"
     local password="mnbmnb"
     local base_mount_point="/mnt"
 
+    # Optional leading flags.
+    local host="" ask_sudo=""
+    while [[ "$1" == -* ]]; do
+        case "$1" in
+            -H|--host) host="$2"; shift 2 ;;
+            --host=*)  host="${1#*=}"; shift ;;
+            -H*)       host="${1#-H}"; shift ;;
+            -S|--ask-sudo) ask_sudo=1; shift ;;
+            *) echo "mount-samba: unknown option: $1" >&2; return 1 ;;
+        esac
+    done
+
     local spec="$1"
     local explicit_path="$2"
     if [[ -z "$spec" ]]; then
-        echo "Usage: mount-samba <ip|//ip/share> [mount/path]" >&2
+        echo "Usage: mount-samba [-H [user@]host] [-S] <ip|//ip/share> [mount/path]" >&2
         echo "  mount-samba 10.5.2.100                          # all shares -> /mnt/10_5_2_100/..." >&2
         echo "  mount-samba //10.5.2.100/AI_Research            # -> /mnt/10_5_2_100/AI_Research" >&2
         echo "  mount-samba //10.5.2.100/AI_Research mount/path # -> /mnt/mount/path" >&2
+        echo "  mount-samba -H host //10.5.2.100/AI_Research    # create the mount on 'host'" >&2
+        echo "  mount-samba -H host -S //10.5.2.100/AI_Research # ...prompting for remote sudo pw" >&2
         return 1
     fi
 
+    # Run a command locally, or on the remote host via SSH (args re-quoted so
+    # spaces/specials survive the remote shell). `ssh -n` keeps ssh from reading
+    # this shell's stdin -- otherwise, inside the `while read share` scan loop,
+    # ssh would swallow the remaining share list and the loop would stop after
+    # the first share.
+    _ms_run() {
+        if [[ -n "$host" ]]; then
+            local a q cmd=""
+            for a in "$@"; do printf -v q '%q' "$a"; cmd+="$q "; done
+            ssh -n "$host" "$cmd"
+        else
+            "$@"
+        fi
+    }
+
+    # Fail early with a clear message if the remote host is unreachable.
+    if [[ -n "$host" ]] && ! _ms_run true; then
+        echo "mount-samba: cannot reach host '$host' over SSH" >&2
+        unset -f _ms_run
+        return 1
+    fi
+
+    # If asked, capture the remote sudo password once (kept only in this local
+    # variable, never placed on a command line or exported).
+    local _ms_sudo_pass=""
+    if [[ -n "$host" && -n "$ask_sudo" ]]; then
+        read -rs -p "[sudo] password for $host: " _ms_sudo_pass; echo
+    fi
+
+    # Run a command with sudo, locally or remotely. When a remote password was
+    # captured, feed it to `sudo -S` over SSH stdin (one prompt for all steps);
+    # otherwise fall back to plain sudo (local, or remote NOPASSWD sudo).
+    _ms_sudo() {
+        if [[ -n "$host" && -n "$_ms_sudo_pass" ]]; then
+            local a q cmd=""
+            for a in "$@"; do printf -v q '%q' "$a"; cmd+="$q "; done
+            printf '%s\n' "$_ms_sudo_pass" | ssh "$host" "sudo -S -p '' $cmd"
+        else
+            _ms_run sudo "$@"
+        fi
+    }
+
+    # uid/gid must belong to the machine the mount lives on (local or remote).
+    local run_uid run_gid
+    run_uid="$(_ms_run id -u)"
+    run_gid="$(_ms_run id -g)"
+
     # CIFS mount options shared by every mount below.
-    local mount_opts="username=$username,password=$password,uid=$(id -u),gid=$(id -g),file_mode=0664,dir_mode=0775"
+    local mount_opts="username=$username,password=$password,uid=$run_uid,gid=$run_gid,file_mode=0664,dir_mode=0775"
 
     # Inner helper: mount one //server/share at the given mount point (idempotent).
     _ms_mount_one() {
         local server_ip="$1" share="$2" mount_point="$3"
-        if mountpoint -q "$mount_point"; then
-            echo "Skipping already mounted share: $mount_point"
+        if _ms_run mountpoint -q "$mount_point"; then
+            echo "Skipping already mounted share: $mount_point${host:+ (on $host)}"
             return 0
         fi
-        sudo mkdir -p "$mount_point"
-        echo "Mounting //$server_ip/$share to $mount_point"
-        sudo mount -t cifs "//$server_ip/$share" "$mount_point" -o "$mount_opts"
+        _ms_sudo mkdir -p "$mount_point"
+        echo "Mounting //$server_ip/$share to $mount_point${host:+ (on $host)}"
+        _ms_sudo mount -t cifs "//$server_ip/$share" "$mount_point" -o "$mount_opts"
     }
 
     # Parse the spec into server_ip and an optional share.
@@ -1151,26 +1216,34 @@ mount-samba() {
             mount_point="$base_mount_point/$ip_path/$share"
         fi
         _ms_mount_one "$server_ip" "$share" "$mount_point"
-        unset -f _ms_mount_one
+        unset -f _ms_mount_one _ms_run _ms_sudo
         return
     fi
 
     # No share given: an explicit mount path makes no sense here.
     if [[ -n "$explicit_path" ]]; then
         echo "mount-samba: a mount path is only valid together with a //ip/share spec" >&2
-        unset -f _ms_mount_one
+        unset -f _ms_mount_one _ms_run _ms_sudo
         return 1
     fi
 
     # Scan the server and mount every advertised disk share (skipping printers).
+    # A failure on one share is reported but does not stop the others.
     echo "Scanning shares on $server_ip..."
+    local -a failed=()
     while read -r share; do
         [ -z "$share" ] && continue
         [[ "$share" == print* ]] && continue
-        _ms_mount_one "$server_ip" "$share" "$base_mount_point/$ip_path/$share"
-    done < <(smbclient -L "//$server_ip" -U "$username%$password" 2>/dev/null | grep "Disk" | awk '{print $1}')
+        _ms_mount_one "$server_ip" "$share" "$base_mount_point/$ip_path/$share" \
+            || failed+=("$share")
+    done < <(_ms_run smbclient -L "//$server_ip" -U "$username%$password" 2>/dev/null | grep "Disk" | awk '{print $1}')
 
-    unset -f _ms_mount_one
+    if (( ${#failed[@]} )); then
+        echo "mount-samba: ${#failed[@]} share(s) failed to mount: ${failed[*]}" >&2
+    fi
+
+    unset -f _ms_mount_one _ms_run _ms_sudo
+    (( ${#failed[@]} == 0 ))   # return non-zero if any share failed
 }
 
 stty stop ^J
