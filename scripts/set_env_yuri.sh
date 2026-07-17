@@ -212,63 +212,118 @@ check-ssh-access() {
     x) mode_bit=1 ;;
   esac
 
-  # Inner helper: check one path component for a needed permission bit,
-  # reporting denials from unix mode bits, ACL user entries, and ACL masks.
+  # Resolve access via the full POSIX ACL algorithm (getfacl available).
+  # The class that applies is decided by identity, and — crucially — once the
+  # user matches the owning group or any named group entry, the decision is made
+  # from the group class ALONE; the 'other' entry is never consulted. This is the
+  # subtlety plain-mode-bit checks miss: being in the owning group can DENY access
+  # that an unrelated user would get via 'other'. Owner and other entries are not
+  # masked; named-user, owning-group, and named-group entries are masked.
+  _csa_acl_check() {
+    local p="$1" need="$2"
+    local -n _out="$3"
+
+    local owner owning_group acl ugroups
+    owner=$(stat -c '%U' "$p" 2>/dev/null)
+    owning_group=$(stat -c '%G' "$p")
+    acl=$(getfacl -p "$p" 2>/dev/null)
+    ugroups=" $(id -Gn "$username" 2>/dev/null) "
+
+    # 3rd colon field of a getfacl line, minus any trailing tab/#effective comment
+    local mask_perm has_mask=1
+    mask_perm=$(awk -F: '/^mask::/{print $3; exit}' <<<"$acl"); mask_perm=${mask_perm%%[[:space:]]*}
+    [[ -z "$mask_perm" ]] && { has_mask=0; mask_perm="rwx"; }
+
+    # 1. Owner → user:: (not masked)
+    if [[ "$username" == "$owner" ]]; then
+      local up; up=$(awk -F: '/^user::/{print $3; exit}' <<<"$acl"); up=${up%%[[:space:]]*}
+      [[ "$up" != *"$need"* ]] && _out+=("owner entry 'user::$up' lacks '$need'")
+      return
+    fi
+
+    # 2. Named user entry → masked
+    local nu; nu=$(awk -F: -v u="$username" '$1=="user"&&$2==u{print $3; exit}' <<<"$acl"); nu=${nu%%[[:space:]]*}
+    if [[ -n "$nu" ]]; then
+      if [[ "$nu" != *"$need"* ]]; then
+        _out+=("entry 'user:$username:$nu' lacks '$need'")
+      elif (( has_mask )) && [[ "$mask_perm" != *"$need"* ]]; then
+        _out+=("mask '$mask_perm' strips '$need' from 'user:$username:$nu'")
+      fi
+      return
+    fi
+
+    # 3. Group class: owning group + any named group the user belongs to.
+    #    Union of matching entries (each masked). No fall-through to 'other'.
+    local matched=0 granted=0 detail=""
+    if [[ "$ugroups" == *" $owning_group "* ]]; then
+      matched=1
+      local gp; gp=$(awk -F: '/^group::/{print $3; exit}' <<<"$acl"); gp=${gp%%[[:space:]]*}
+      detail+="group::$gp "
+      [[ "$gp" == *"$need"* && "$mask_perm" == *"$need"* ]] && granted=1
+    fi
+    local line gname gp
+    while IFS= read -r line; do
+      gname=$(cut -d: -f2 <<<"$line")
+      [[ -z "$gname" || "$ugroups" != *" $gname "* ]] && continue
+      matched=1
+      gp=$(cut -d: -f3 <<<"$line"); gp=${gp%%[[:space:]]*}
+      detail+="group:$gname:$gp "
+      [[ "$gp" == *"$need"* && "$mask_perm" == *"$need"* ]] && granted=1
+    done < <(grep -E '^group:[^:]+:' <<<"$acl")
+
+    if (( matched )); then
+      if (( ! granted )); then
+        local why="group class (${detail%% }) grants no '$need'"
+        (( has_mask )) && why+=" [mask '$mask_perm']"
+        why+=" — group membership blocks fall-through to 'other'"
+        _out+=("$why")
+      fi
+      return
+    fi
+
+    # 4. Other → not masked
+    local op; op=$(awk -F: '/^other::/{print $3; exit}' <<<"$acl"); op=${op%%[[:space:]]*}
+    [[ "$op" != *"$need"* ]] && _out+=("other entry 'other::$op' lacks '$need'")
+  }
+
+  # Fallback resolution from plain unix mode bits (getfacl unavailable).
+  _csa_mode_check() {
+    local p="$1" needed_bit="$2" label_unused="$3"
+    local -n _out="$4"
+    local owner owner_gid perms mode_str applicable_bits perm_source
+    owner=$(stat -c '%U' "$p" 2>/dev/null)
+    owner_gid=$(stat -c '%g' "$p")
+    perms=$(stat -c '%a' "$p")
+    mode_str=$(stat -c '%A' "$p")
+    if [[ "$username" == "$owner" ]]; then
+      applicable_bits=$(( (8#$perms >> 6) & 7 )); perm_source="owner"
+    elif echo "$groups" | grep -qw "$owner_gid"; then
+      applicable_bits=$(( (8#$perms >> 3) & 7 )); perm_source="group"
+    else
+      applicable_bits=$(( 8#$perms & 7 )); perm_source="other"
+    fi
+    (( (applicable_bits & needed_bit) == 0 )) && \
+      _out+=("permission denied ($perm_source bits: $mode_str)")
+  }
+
+  # Inner helper: check one path component for a needed permission bit.
   _csa_check_component() {
     local check_path="$1"
     local needed_bit="$2"
     local label="$3"
     local issues=()
 
-    local owner owner_gid perms mode_str
-    owner=$(stat -c '%U' "$check_path" 2>/dev/null)
-    owner_gid=$(stat -c '%g' "$check_path")
-    perms=$(stat -c '%a' "$check_path")
-    mode_str=$(stat -c '%A' "$check_path")
-
-    local applicable_bits perm_source
-    if [[ "$username" == "$owner" ]]; then
-      applicable_bits=$(( (8#$perms >> 6) & 7 ))
-      perm_source="owner"
-    elif echo "$groups" | grep -qw "$owner_gid"; then
-      applicable_bits=$(( (8#$perms >> 3) & 7 ))
-      perm_source="group"
-    else
-      applicable_bits=$(( 8#$perms & 7 ))
-      perm_source="other"
-    fi
-
-    if (( (applicable_bits & needed_bit) == 0 )); then
-      issues+=("permission denied ($perm_source bits: $mode_str)")
-    fi
+    local needed_letter
+    case "$needed_bit" in
+      4) needed_letter=r ;;
+      2) needed_letter=w ;;
+      1) needed_letter=x ;;
+    esac
 
     if command -v getfacl &>/dev/null; then
-      local acl_out
-      acl_out=$(getfacl -p "$check_path" 2>/dev/null)
-
-      local acl_user_entry
-      acl_user_entry=$(echo "$acl_out" | grep -E "^user:${username}:")
-      if [[ -n "$acl_user_entry" ]]; then
-        local acl_perms
-        acl_perms=$(echo "$acl_user_entry" | cut -d: -f3)
-        case "$mode" in
-          r) [[ "$acl_perms" != *r* ]] && issues+=("ACL user entry denies 'r': $acl_user_entry") ;;
-          w) [[ "$acl_perms" != *w* ]] && issues+=("ACL user entry denies 'w': $acl_user_entry") ;;
-          x) [[ "$acl_perms" != *x* ]] && issues+=("ACL user entry denies 'x': $acl_user_entry") ;;
-        esac
-      fi
-
-      local mask_entry
-      mask_entry=$(echo "$acl_out" | grep -E "^mask::")
-      if [[ -n "$mask_entry" ]]; then
-        local mask_perms
-        mask_perms=$(echo "$mask_entry" | cut -d: -f3)
-        case "$mode" in
-          r) [[ "$mask_perms" != *r* ]] && issues+=("ACL mask restricts 'r': $mask_entry") ;;
-          w) [[ "$mask_perms" != *w* ]] && issues+=("ACL mask restricts 'w': $mask_entry") ;;
-          x) [[ "$mask_perms" != *x* ]] && issues+=("ACL mask restricts 'x': $mask_entry") ;;
-        esac
-      fi
+      _csa_acl_check "$check_path" "$needed_letter" issues
+    else
+      _csa_mode_check "$check_path" "$needed_bit" "$needed_letter" issues
     fi
 
     if [[ ${#issues[@]} -gt 0 ]]; then
@@ -366,7 +421,7 @@ check-ssh-access() {
   fi
 
   # Clean up inner functions
-  unset -f _csa_check_component _csa_walk_path
+  unset -f _csa_check_component _csa_acl_check _csa_mode_check _csa_walk_path
 }
 
 
@@ -1092,10 +1147,12 @@ complete -F _workon_rm_complete workon-rm
 #   mount-samba //<ip>/<share>             mount that one share at /mnt/<_-separated-ip>/<share>
 #   mount-samba //<ip>/<share> <mnt/path>  mount that one share nested under /mnt: /mnt/<mnt/path>
 #   mount-samba -H [user@]host <ip> ...    create the mount on a remote host over SSH
+#   mount-samba -H host -p 2222 <ip> ...   ...over SSH on a nonstandard port
 # e.g.  mount-samba 10.5.2.100
 #       mount-samba //10.5.2.100/AI_Research            -> /mnt/10_5_2_100/AI_Research
 #       mount-samba //10.5.2.100/AI_Research mount/path -> /mnt/mount/path
 #       mount-samba -H ai-ubuntu@10.5.2.50 //10.5.2.100/AI_Research   (mounts on 10.5.2.50)
+#       mount-samba -H ai-ubuntu@10.5.2.50 -p 2222 //10.5.2.100/AI_Research
 # The remote user needs sudo for mount: either NOPASSWD sudo, or pass -S to be
 # prompted once for the remote sudo password (fed to sudo -S over SSH stdin).
 mount-samba() {
@@ -1104,26 +1161,32 @@ mount-samba() {
     local base_mount_point="/mnt"
 
     # Optional leading flags.
-    local host="" ask_sudo=""
+    local host="" ask_sudo="" port=""
     while [[ "$1" == -* ]]; do
         case "$1" in
             -H|--host) host="$2"; shift 2 ;;
             --host=*)  host="${1#*=}"; shift ;;
             -H*)       host="${1#-H}"; shift ;;
+            -p|--port) port="$2"; shift 2 ;;
+            --port=*)  port="${1#*=}"; shift ;;
+            -p*)       port="${1#-p}"; shift ;;
             -S|--ask-sudo) ask_sudo=1; shift ;;
             *) echo "mount-samba: unknown option: $1" >&2; return 1 ;;
         esac
     done
+    local -a ssh_opts=()
+    [[ -n "$port" ]] && ssh_opts=(-p "$port")
 
     local spec="$1"
     local explicit_path="$2"
     if [[ -z "$spec" ]]; then
-        echo "Usage: mount-samba [-H [user@]host] [-S] <ip|//ip/share> [mount/path]" >&2
+        echo "Usage: mount-samba [-H [user@]host] [-p ssh-port] [-S] <ip|//ip/share> [mount/path]" >&2
         echo "  mount-samba 10.5.2.100                          # all shares -> /mnt/10_5_2_100/..." >&2
         echo "  mount-samba //10.5.2.100/AI_Research            # -> /mnt/10_5_2_100/AI_Research" >&2
         echo "  mount-samba //10.5.2.100/AI_Research mount/path # -> /mnt/mount/path" >&2
         echo "  mount-samba -H host //10.5.2.100/AI_Research    # create the mount on 'host'" >&2
         echo "  mount-samba -H host -S //10.5.2.100/AI_Research # ...prompting for remote sudo pw" >&2
+        echo "  mount-samba -H host -p 2222 //10.5.2.100/AI_Research # ...SSH on a nonstandard port" >&2
         return 1
     fi
 
@@ -1136,7 +1199,7 @@ mount-samba() {
         if [[ -n "$host" ]]; then
             local a q cmd=""
             for a in "$@"; do printf -v q '%q' "$a"; cmd+="$q "; done
-            ssh -n "$host" "$cmd"
+            ssh -n "${ssh_opts[@]}" "$host" "$cmd"
         else
             "$@"
         fi
@@ -1163,7 +1226,7 @@ mount-samba() {
         if [[ -n "$host" && -n "$_ms_sudo_pass" ]]; then
             local a q cmd=""
             for a in "$@"; do printf -v q '%q' "$a"; cmd+="$q "; done
-            printf '%s\n' "$_ms_sudo_pass" | ssh "$host" "sudo -S -p '' $cmd"
+            printf '%s\n' "$_ms_sudo_pass" | ssh "${ssh_opts[@]}" "$host" "sudo -S -p '' $cmd"
         else
             _ms_run sudo "$@"
         fi
