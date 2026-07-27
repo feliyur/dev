@@ -1152,9 +1152,16 @@ complete -F _workon_rm_complete workon-rm
 #   mount-samba //<ip>/<share> <mnt/path>  mount that one share nested under /mnt: /mnt/<mnt/path>
 #   mount-samba -H [user@]host <ip> ...    create the mount on a remote host over SSH
 #   mount-samba -H host -p 2222 <ip> ...   ...over SSH on a nonstandard port
+#   mount-samba -c <file> <ip> ...         authenticate with a CIFS credentials file
+#                                          (username=/password=[/domain=] lines) instead
+#                                          of the built-in default user; the file must
+#                                          exist on the machine the mount is created on
+#                                          (the remote host when -H is used) and is read
+#                                          there via sudo, so root-only files work
 # e.g.  mount-samba 10.5.2.100
 #       mount-samba //10.5.2.100/AI_Research            -> /mnt/10_5_2_100/AI_Research
 #       mount-samba //10.5.2.100/AI_Research mount/path -> /mnt/mount/path
+#       mount-samba -c /etc/samba/credentials.ai_research_me_admin //10.5.2.100/AI_Research
 #       mount-samba -H ai-ubuntu@10.5.2.50 //10.5.2.100/AI_Research   (mounts on 10.5.2.50)
 #       mount-samba -H ai-ubuntu@10.5.2.50 -p 2222 //10.5.2.100/AI_Research
 # The remote user needs sudo for mount: either NOPASSWD sudo, or pass -S to be
@@ -1165,7 +1172,7 @@ mount-samba() {
     local base_mount_point="/mnt"
 
     # Optional leading flags.
-    local host="" ask_sudo="" port=""
+    local host="" ask_sudo="" port="" cred_file=""
     while [[ "$1" == -* ]]; do
         case "$1" in
             -H|--host) host="$2"; shift 2 ;;
@@ -1174,6 +1181,9 @@ mount-samba() {
             -p|--port) port="$2"; shift 2 ;;
             --port=*)  port="${1#*=}"; shift ;;
             -p*)       port="${1#-p}"; shift ;;
+            -c|--credentials) cred_file="$2"; shift 2 ;;
+            --credentials=*)  cred_file="${1#*=}"; shift ;;
+            -c*)              cred_file="${1#-c}"; shift ;;
             -S|--ask-sudo) ask_sudo=1; shift ;;
             *) echo "mount-samba: unknown option: $1" >&2; return 1 ;;
         esac
@@ -1184,10 +1194,13 @@ mount-samba() {
     local spec="$1"
     local explicit_path="$2"
     if [[ -z "$spec" ]]; then
-        echo "Usage: mount-samba [-H [user@]host] [-p ssh-port] [-S] <ip|//ip/share> [mount/path]" >&2
+        echo "Usage: mount-samba [-H [user@]host] [-p ssh-port] [-S] [-c credentials-file] <ip|//ip/share> [mount/path]" >&2
         echo "  mount-samba 10.5.2.100                          # all shares -> /mnt/10_5_2_100/..." >&2
         echo "  mount-samba //10.5.2.100/AI_Research            # -> /mnt/10_5_2_100/AI_Research" >&2
         echo "  mount-samba //10.5.2.100/AI_Research mount/path # -> /mnt/mount/path" >&2
+        echo "  mount-samba -c /etc/samba/credentials.ai_research_me_admin //10.5.2.100/AI_Research" >&2
+        echo "                                                  # ...auth from a credentials file" >&2
+        echo "                                                  #    (on the mounting machine)" >&2
         echo "  mount-samba -H host //10.5.2.100/AI_Research    # create the mount on 'host'" >&2
         echo "  mount-samba -H host -S //10.5.2.100/AI_Research # ...prompting for remote sudo pw" >&2
         echo "  mount-samba -H host -p 2222 //10.5.2.100/AI_Research # ...SSH on a nonstandard port" >&2
@@ -1241,8 +1254,16 @@ mount-samba() {
     run_uid="$(_ms_run id -u)"
     run_gid="$(_ms_run id -g)"
 
-    # CIFS mount options shared by every mount below.
-    local mount_opts="username=$username,password=$password,uid=$run_uid,gid=$run_gid,file_mode=0664,dir_mode=0775"
+    # CIFS mount options shared by every mount below. A credentials file (read
+    # by mount.cifs on the mounting machine, so it may be root-only) replaces
+    # the built-in username/password.
+    local mount_opts
+    if [[ -n "$cred_file" ]]; then
+        mount_opts="credentials=$cred_file"
+    else
+        mount_opts="username=$username,password=$password"
+    fi
+    mount_opts+=",uid=$run_uid,gid=$run_gid,file_mode=0664,dir_mode=0775"
 
     # Inner helper: mount one //server/share at the given mount point (idempotent).
     _ms_mount_one() {
@@ -1303,7 +1324,14 @@ mount-samba() {
         [[ "$share" == print* ]] && continue
         _ms_mount_one "$server_ip" "$share" "$base_mount_point/$ip_path/$share" \
             || failed+=("$share")
-    done < <(_ms_run smbclient -L "//$server_ip" -U "$username%$password" 2>/dev/null | grep "Disk" | awk '{print $1}')
+    done < <(
+        if [[ -n "$cred_file" ]]; then
+            # sudo: the credentials file is often readable by root only.
+            _ms_sudo smbclient -L "//$server_ip" -A "$cred_file" 2>/dev/null
+        else
+            _ms_run smbclient -L "//$server_ip" -U "$username%$password" 2>/dev/null
+        fi | grep "Disk" | awk '{print $1}'
+    )
 
     if (( ${#failed[@]} )); then
         echo "mount-samba: ${#failed[@]} share(s) failed to mount: ${failed[*]}" >&2
