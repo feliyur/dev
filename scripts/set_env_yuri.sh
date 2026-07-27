@@ -91,6 +91,10 @@ docker-start-with-proxy() {
 #--name extract_athena_images bcr-de01.inside.bosch.cloud/perkit/dst-lh5-converter:latest bash
 }
 
+docker-list-network-interfaces() {
+    docker ps -q | xargs docker inspect -f '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'
+}
+
 alias tls="tmux ls"
 alias ta="tmux attach-session -t"
 
